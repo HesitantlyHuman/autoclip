@@ -17,7 +17,7 @@ class Clipper:
         parameters: Iterator[torch.nn.parameter.Parameter],
         defaults: Dict[str, Any],
     ) -> None:
-        self.parameter_groups: List[Dict[str, Any]] = []
+        self.param_groups: List[Dict[str, torch.Tensor]] = []
         self.verify_parameter_settings(settings=defaults)
         self.defaults = defaults
         self.state = defaultdict(dict)
@@ -29,45 +29,48 @@ class Clipper:
                 + torch.typename(parameters)
             )
 
-        parameter_groups = list(parameters)
-        if len(parameter_groups) == 0:
+        param_groups = list(parameters)
+        if len(param_groups) == 0:
             raise ValueError(
                 f"Clipper {type(self).__name__} got an empty parameter list"
             )
-        if not isinstance(parameter_groups[0], dict):
-            parameter_groups = [{"params": parameter_groups}]
+        if not isinstance(param_groups[0], dict):
+            param_groups = [{"params": param_groups}]
 
-        for parameter_group in parameter_groups:
-            self.add_param_group(parameter_group=parameter_group)
+        for param_group in param_groups:
+            self.add_param_group(param_group=param_group)
 
     @classmethod
     def as_optimizer(
         cls: "Clipper",
         optimizer: torch.optim.Optimizer,
+        lr_regularize: bool = True,
         **kwargs,
     ) -> "OptimizerWithClipping":
         parameters = chain.from_iterable(
-            [parameter_group["params"] for parameter_group in optimizer.param_groups]
+            [param_group["params"] for param_group in optimizer.param_groups]
         )
         clipper = cls(parameters=parameters, **kwargs)
-        return OptimizerWithClipping(optimizer=optimizer, clipper=clipper)
+        return OptimizerWithClipping(
+            optimizer=optimizer, clipper=clipper, lr_regularize=lr_regularize
+        )
 
     def verify_parameter_settings(self, settings: Dict[str, Any]) -> None:
-        raise NotImplementedError
+        raise NotImplementedError()
 
-    def step(self) -> None:
-        raise NotImplementedError
+    def step(self, param_group_learning_rates: List[torch.Tensor] = None) -> None:
+        raise NotImplementedError()
 
     def state_dict(self) -> Dict[str, Any]:
-        packed_parameter_groups = []
-        for parameter_group in self.parameter_groups:
-            packed_parameter_group = {
-                key: value for key, value in parameter_group.items() if key != "params"
+        packed_param_groups = []
+        for param_group in self.param_groups:
+            packed_param_group = {
+                key: value for key, value in param_group.items() if key != "params"
             }
-            packed_parameter_group["params"] = [
-                id(parameter) for parameter in parameter_group["params"]
+            packed_param_group["params"] = [
+                id(parameter) for parameter in param_group["params"]
             ]
-            packed_parameter_groups.append(packed_parameter_group)
+            packed_param_groups.append(packed_param_group)
 
         packed_state = {
             (id(k) if isinstance(k, torch.Tensor) else k): v
@@ -76,13 +79,13 @@ class Clipper:
 
         return {
             "state": packed_state,
-            "param_groups": packed_parameter_groups,
+            "param_groups": packed_param_groups,
         }
 
     def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
         loaded_state_dict = deepcopy(state_dict)
         local_groups, saved_groups = (
-            self.parameter_groups,
+            self.param_groups,
             loaded_state_dict["param_groups"],
         )
 
@@ -117,17 +120,17 @@ class Clipper:
             else:
                 state[key] = value
 
-        new_parameter_groups = []
+        new_param_groups = []
         for local_group, saved_group in zip(local_groups, saved_groups):
             saved_group["params"] = local_group["params"]
-            new_parameter_groups.append(saved_group)
+            new_param_groups.append(saved_group)
 
         self.state = state
-        self.parameter_groups = new_parameter_groups
+        self.param_groups = new_param_groups
 
     def add_param_group(
         self,
-        parameter_group: Dict[str, Union[torch.Tensor, List[torch.Tensor]]],
+        param_group: Dict[str, Union[torch.Tensor, List[torch.Tensor]]],
         **kwargs,
     ) -> None:
         """Add a param_group to the :class:`Optimizer` s `param_groups`.
@@ -139,12 +142,12 @@ class Clipper:
             param_group (dict): Specifies what Tensors should be optimized along with group
             specific optimization options.
         """
-        if not isinstance(parameter_group, Mapping):
-            parameter_group = {"params": parameter_group}
+        if not isinstance(param_group, Mapping):
+            param_group = {"params": param_group}
 
-        parameters = parameter_group["params"]
+        parameters = param_group["params"]
         if isinstance(parameters, torch.Tensor):
-            parameter_group["params"] = [parameters]
+            param_group["params"] = [parameters]
         elif isinstance(parameters, set):
             raise TypeError(
                 "Clipping parameters must be ordered collections. "
@@ -152,9 +155,9 @@ class Clipper:
                 "Please use a list instead."
             )
         else:
-            parameter_group["params"] = list(parameters)
+            param_group["params"] = list(parameters)
 
-        for parameter in parameter_group["params"]:
+        for parameter in param_group["params"]:
             if not isinstance(parameter, torch.Tensor):
                 raise TypeError(
                     f"Clipper {type(self).__name__} can only clip Tensors, "
@@ -167,30 +170,30 @@ class Clipper:
                 )
 
         for name, default in self.defaults.items():
-            parameter_group.setdefault(name, default)
-        parameter_group.update(kwargs)
-        self.verify_parameter_settings(parameter_group)
+            param_group.setdefault(name, default)
+        param_group.update(kwargs)
+        self.verify_parameter_settings(param_group)
 
-        parameters = parameter_group["params"]
+        parameters = param_group["params"]
         if len(parameters) != len(set(parameters)):
             raise ValueError(
                 "Clipper contains a parameter group with duplicate parameters."
             )
 
         parameter_set = set()
-        for group in self.parameter_groups:
+        for group in self.param_groups:
             parameter_set.update(set(group["params"]))
 
-        if not parameter_set.isdisjoint(set(parameter_group["params"])):
+        if not parameter_set.isdisjoint(set(param_group["params"])):
             raise ValueError(
                 "Some clipping parameters appear in more than one parameter group"
             )
 
-        self.parameter_groups.append(parameter_group)
+        self.param_groups.append(param_group)
 
     def __repr__(self):
         format_string = self.__class__.__name__ + " ("
-        for i, group in enumerate(self.parameter_groups):
+        for i, group in enumerate(self.param_groups):
             format_string += "\n"
             format_string += "Parameter Group {0}\n".format(i)
             for key in sorted(group.keys()):
@@ -201,21 +204,33 @@ class Clipper:
 
 
 class OptimizerWithClipping(torch.optim.Optimizer):
-    def __init__(self, optimizer: torch.optim.Optimizer, clipper: Clipper) -> None:
+    def __init__(
+        self,
+        optimizer: torch.optim.Optimizer,
+        clipper: Clipper,
+        lr_regularize: bool = True,
+    ) -> None:
         self.optimizer = optimizer
         self.clipper = clipper
+        self.lr_regularize = lr_regularize
 
     def step(
         self, closure: Union[Callable[[], float], None] = None
     ) -> Union[float, None]:
-        self.clipper.step()
+        if self.lr_regularize:
+            param_group_learning_rates = [
+                param_group["lr"] for param_group in self.optimizer.param_groups
+            ]
+            self.clipper.step(param_group_learning_rates=param_group_learning_rates)
+        else:
+            self.clipper.step()
         return self.optimizer.step(closure=closure)
 
     def add_param_group(
         self, param_group: Dict[str, Union[torch.Tensor, List[torch.Tensor]]], **kwargs
     ) -> None:
         self.optimizer.add_param_group(param_group=param_group)
-        self.clipper.add_param_group(parameter_group=param_group, **kwargs)
+        self.clipper.add_param_group(param_group=param_group, **kwargs)
 
     def zero_grad(self, set_to_none: bool = False) -> None:
         self.optimizer.zero_grad(set_to_none=set_to_none)

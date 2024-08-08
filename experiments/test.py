@@ -42,12 +42,10 @@ def train(
     train_loader: torch.utils.data.DataLoader,
     optimizer: torch.optim.Optimizer,
     lr_scheduler: torch.optim.lr_scheduler._LRScheduler,
-    epoch: int,
     device: torch.device = torch.device("cuda"),
-    log_interval: int = 10,
 ):
     model.train()
-    for batch_idx, (data, target) in enumerate(train_loader):
+    for _, (data, target) in enumerate(train_loader):
         data, target = data.to(device), target.to(device)
         optimizer.zero_grad()
         output = model(data)
@@ -55,23 +53,13 @@ def train(
         loss.backward()
         optimizer.step()
         lr_scheduler.step()
-        if batch_idx % log_interval == 0:
-            print(
-                "Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}".format(
-                    epoch,
-                    batch_idx * len(data),
-                    len(train_loader.dataset),
-                    100.0 * batch_idx / len(train_loader),
-                    loss.item(),
-                )
-            )
 
 
 def test(
     model: nn.Module,
     test_loader: torch.utils.data.DataLoader,
     device: torch.device = torch.device("cuda"),
-):
+) -> float:
     model.eval()
     test_loss = 0
     correct = 0
@@ -88,24 +76,26 @@ def test(
             correct += pred.eq(target.view_as(pred)).sum().item()
 
     test_loss /= len(test_loader.dataset)
-
-    print(
-        "\nTest set: Average loss: {:.4f}, Accuracy: {}/{} ({:.0f}%)\n".format(
-            test_loss,
-            correct,
-            len(test_loader.dataset),
-            100.0 * correct / len(test_loader.dataset),
-        )
-    )
+    return test_loss
 
 
-def main():
-    config = {"num_epochs": 3, "max_learning_rate": 1e-3, "weight_decay": 0.05}
+def run_trial(
+    epochs: int,
+    learning_rate: float,
+    regularization: bool,
+    quantile: float,
+    use_clipping: bool,
+):
+    config = {
+        "num_epochs": epochs,
+        "max_learning_rate": learning_rate,
+        "weight_decay": 0.05,
+    }
     train_kwargs = {"batch_size": 64}
     test_kwargs = {"batch_size": 1000}
     if torch.cuda.is_available():
         device = torch.device("cuda")
-        cuda_kwargs = {"num_workers": 1, "pin_memory": True, "shuffle": True}
+        cuda_kwargs = {"num_workers": 12, "pin_memory": True, "shuffle": True}
         train_kwargs.update(cuda_kwargs)
         test_kwargs.update(cuda_kwargs)
     else:
@@ -125,9 +115,13 @@ def main():
         lr=config["max_learning_rate"],
         weight_decay=config["weight_decay"],
     )
-    optimizer = QuantileClip.as_optimizer(
-        optimizer=optimizer, quantile=0.8, history_length=1000, lr_regularize=False
-    )
+    if use_clipping:
+        optimizer = QuantileClip.as_optimizer(
+            optimizer=optimizer,
+            quantile=quantile,
+            history_length=1000,
+            lr_regularize=regularization,
+        )
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
         optimizer,
         max_lr=config["max_learning_rate"],
@@ -135,20 +129,60 @@ def main():
         epochs=config["num_epochs"],
     )
 
-    for epoch in range(1, config["num_epochs"] + 1):
+    best_test_loss = torch.inf
+    for _ in range(1, config["num_epochs"] + 1):
         train(
             model=model,
             train_loader=train_loader,
             optimizer=optimizer,
             lr_scheduler=scheduler,
-            epoch=epoch,
             device=device,
-            log_interval=10,
         )
-        test(model=model, test_loader=test_loader, device=device)
+        test_loss = test(model=model, test_loader=test_loader, device=device)
+        if test_loss < best_test_loss:
+            best_test_loss = test_loss
 
-    torch.save(model.state_dict(), "mnist_cnn.pth")
+    return best_test_loss
 
 
 if __name__ == "__main__":
-    main()
+    import csv
+    from tqdm import tqdm
+
+    use_clipping = False
+    overall_progress = tqdm(total=5 * 30, desc="All Trials", smoothing=0.95)
+
+    with open("experiments/results/mnist.csv", "a") as f:
+        writer = csv.writer(f)
+        epoch_progress_bar = tqdm([10], desc="Epochs _")
+        for epochs in epoch_progress_bar:
+            epoch_progress_bar.set_description(f"Epochs {epochs}")
+            lr_progress_bar = tqdm(
+                [1e-5, 1e-4, 1e-3, 1e-2, 1e-1], desc="Learning Rate _"
+            )
+            for learning_rate in lr_progress_bar:
+                lr_progress_bar.set_description(f"Learning Rate {learning_rate}")
+                for _ in tqdm(range(30), desc="Trials"):
+                    best_loss = run_trial(epochs, learning_rate, False, 1.0, False)
+                    writer.writerow(
+                        [epochs, learning_rate, False, 1.0, best_loss, False]
+                    )
+                    overall_progress.update(1)
+                # regularize_progress_bar = tqdm([True, False], desc="Regularization _")
+                # for regularize in regularize_progress_bar:
+                #     regularize_progress_bar.set_description(
+                #         f"Regularization {regularize}"
+                #     )
+                #     quantile_progress_bar = tqdm(
+                #         [0.5, 0.7, 0.8, 0.9, 0.95, 0.99, 1.0], desc="Quantile _"
+                #     )
+                #     for quantile in quantile_progress_bar:
+                #         quantile_progress_bar.set_description(f"Quantile {quantile}")
+                #         for trial in tqdm(range(5), desc="Trials"):
+                #             best_loss = run_trial(
+                #                 epochs, learning_rate, regularize, quantile
+                #             )
+                #             writer.writerow(
+                #                 [epochs, learning_rate, regularize, quantile, best_loss]
+                #             )
+                #             overall_progress.update(1)
